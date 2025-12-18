@@ -1,0 +1,17 @@
+{
+  "name": "vetra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vetra: an MVP PR review harness (Planner-Executor-Verifier)",
+  "license": "UNLICENSED",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build",
+    "dev": "tsc -w -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.3"
+  }
+}
