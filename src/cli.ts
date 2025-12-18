@@ -6,6 +6,7 @@ import { runReview } from './review';
 import type { BudgetMode, PullRequestMetadata, VetraConfig } from './types';
 import { recordOutcome, recordReview } from './memory/jsonl';
 import { HeuristicVerifierModel } from './model/heuristic';
+import { OpenAIChatCommentChecker, OpenAIChatVerifierModel } from './model/openai';
 
 function usage(): string {
   return [
@@ -20,6 +21,8 @@ function usage(): string {
     '  --desc <text>         PR description',
     '  --config <path>       Path to vetra config JSON (default: <repo>/vetra.config.json if present)',
     '  --budget <mode>       quick|standard|deep',
+    '  --model <model>       heuristic|openai (default: heuristic)',
+    '  --checker <checker>   none|openai (default: auto)',
     '  --json                Output JSON instead of Markdown',
     '  --no-log              Do not write .vetra/reviews.jsonl',
     '',
@@ -119,7 +122,36 @@ async function main() {
     source: 'local'
   };
 
-  const model = new HeuristicVerifierModel();
+  const modelName = typeof flags.model === 'string' ? flags.model : 'heuristic';
+  const checkerFlag = typeof flags.checker === 'string' ? flags.checker : 'auto';
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  const baseUrl = process.env.VETRA_OPENAI_BASE_URL;
+
+  const reviewModelName = process.env.VETRA_OPENAI_REVIEW_MODEL ?? process.env.VETRA_OPENAI_MODEL ?? 'gpt-4o-mini';
+  const checkerModelName = process.env.VETRA_OPENAI_CHECKER_MODEL ?? 'gpt-4o-mini';
+
+  const model =
+    modelName === 'openai'
+      ? (() => {
+          if (!apiKey) {
+            throw new Error('Missing OPENAI_API_KEY (required for --model openai).');
+          }
+          return new OpenAIChatVerifierModel({ apiKey, model: reviewModelName, baseUrl });
+        })()
+      : new HeuristicVerifierModel();
+
+  const checker =
+    checkerFlag === 'none'
+      ? undefined
+      : checkerFlag === 'openai' || (checkerFlag === 'auto' && modelName === 'openai')
+        ? (() => {
+            if (!apiKey) {
+              throw new Error('Missing OPENAI_API_KEY (required for --checker openai).');
+            }
+            return new OpenAIChatCommentChecker({ apiKey, model: checkerModelName, baseUrl });
+          })()
+        : undefined;
 
   const result = await runReview({
     repoRoot,
@@ -128,7 +160,8 @@ async function main() {
     meta,
     config,
     budgetMode: parseBudgetMode(flags.budget),
-    model
+    model,
+    checker
   });
 
   const noLog = flags['no-log'] === true;
