@@ -5,9 +5,13 @@
   "description": "Vetra: an MVP PR review harness (Planner-Executor-Verifier)",
   "license": "UNLICENSED",
   "main": "dist/src/index.js",
+  "bin": {
+    "vetra": "dist/src/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
+    "demo": "npm run build && node dist/scripts/demo.js",
     "dev": "tsc -w -p tsconfig.json"
   },
   "devDependencies": {

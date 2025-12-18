@@ -1,0 +1,35 @@
+{
+  "commands": {
+    "test": "node --test",
+    "benchmark": "node bench.js"
+  },
+  "checks": {
+    "metamorphic": {
+      "enabled": true,
+      "specs": [
+        {
+          "module": "src/normalize.js",
+          "export": "normalizeWhitespace",
+          "relation": "idempotent",
+          "input": "string",
+          "samples": 80
+        }
+      ]
+    },
+    "mutation": {
+      "enabled": true,
+      "maxMutants": 6
+    },
+    "benchmark": {
+      "enabled": true
+    }
+  },
+  "verifier": {
+    "requireEvidenceForHighSeverity": true,
+    "maxComments": 12
+  },
+  "planner": {
+    "sensitivePathPatterns": ["auth", "crypto", "payments", "secrets"]
+  }
+}
+
