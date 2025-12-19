@@ -1,6 +1,6 @@
 # vetra
 
-vetra is a TypeScript MVP PR review harness implementing a Planner–Executor–Verifier (PEV) pipeline.
+A TypeScript MVP PR review harness implementing a Planner/Executor/Verifier (PEV) pipeline.
 
 ## Demo
 
