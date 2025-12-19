@@ -76,6 +76,25 @@ function parseBudgetMode(mode: unknown): BudgetMode | undefined {
   return undefined;
 }
 
+function parseEnvCsv(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const parts = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
+}
+
+function buildOpenRouterHeadersFromEnv(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const referer = process.env.OPENROUTER_HTTP_REFERER ?? process.env.OPENROUTER_SITE_URL;
+  const title = process.env.OPENROUTER_X_TITLE ?? process.env.OPENROUTER_APP_NAME;
+
+  if (referer) headers['HTTP-Referer'] = referer;
+  if (title) headers['X-Title'] = title;
+  return headers;
+}
+
 async function main() {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
 
@@ -125,19 +144,23 @@ async function main() {
   const modelName = typeof flags.model === 'string' ? flags.model : 'heuristic';
   const checkerFlag = typeof flags.checker === 'string' ? flags.checker : 'auto';
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  const baseUrl = process.env.VETRA_OPENAI_BASE_URL;
+  const apiKeys = parseEnvCsv(process.env.OPENAI_API_KEY ?? process.env.OPENROUTER_API_KEY);
+  const baseUrls =
+    parseEnvCsv(
+      process.env.VETRA_OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE ?? process.env.OPENROUTER_API_BASE ?? process.env.OPENROUTER_BASE_URL
+    ) ?? ['https://openrouter.ai/api/v1'];
 
-  const reviewModelName = process.env.VETRA_OPENAI_REVIEW_MODEL ?? process.env.VETRA_OPENAI_MODEL ?? 'gpt-4o-mini';
-  const checkerModelName = process.env.VETRA_OPENAI_CHECKER_MODEL ?? 'gpt-4o-mini';
+  const reviewModelName = process.env.VETRA_OPENAI_REVIEW_MODEL ?? process.env.VETRA_OPENAI_MODEL ?? 'openai/gpt-5.1-codex-max';
+  const checkerModelName = process.env.VETRA_OPENAI_CHECKER_MODEL ?? 'openai/gpt-5.1-codex-max';
+  const openrouterHeaders = buildOpenRouterHeadersFromEnv();
 
   const model =
     modelName === 'openai'
       ? (() => {
-          if (!apiKey) {
-            throw new Error('Missing OPENAI_API_KEY (required for --model openai).');
+          if (!apiKeys || apiKeys.length === 0) {
+            throw new Error('Missing OPENAI_API_KEY or OPENROUTER_API_KEY (required for --model openai).');
           }
-          return new OpenAIChatVerifierModel({ apiKey, model: reviewModelName, baseUrl });
+          return new OpenAIChatVerifierModel({ apiKey: apiKeys, model: reviewModelName, baseUrl: baseUrls, headers: openrouterHeaders });
         })()
       : new HeuristicVerifierModel();
 
@@ -146,10 +169,10 @@ async function main() {
       ? undefined
       : checkerFlag === 'openai' || (checkerFlag === 'auto' && modelName === 'openai')
         ? (() => {
-            if (!apiKey) {
-              throw new Error('Missing OPENAI_API_KEY (required for --checker openai).');
+            if (!apiKeys || apiKeys.length === 0) {
+              throw new Error('Missing OPENAI_API_KEY or OPENROUTER_API_KEY (required for --checker openai).');
             }
-            return new OpenAIChatCommentChecker({ apiKey, model: checkerModelName, baseUrl });
+            return new OpenAIChatCommentChecker({ apiKey: apiKeys, model: checkerModelName, baseUrl: baseUrls, headers: openrouterHeaders });
           })()
         : undefined;
 

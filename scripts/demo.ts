@@ -3,6 +3,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { buildPullRequestContext } from '../src/context/build';
+import { runBenchmarkComparison } from '../src/checks/benchmark';
+import { runCiCommand } from '../src/checks/ci';
+import { runMetamorphicChecks } from '../src/checks/metamorphic';
+import { runDiffScopedMutationTesting } from '../src/checks/mutation';
+import { createWorktree } from '../src/git/worktree';
+import { formatReviewMarkdown } from '../src/format/markdown';
+import { planReview } from '../src/planner/planner';
+import { HeuristicVerifierModel } from '../src/model/heuristic';
+import { verifyAndRankComments } from '../src/verifier/verifier';
+import type { BudgetMode, EvidenceArtifact, PlanAction, PullRequestContext, ReviewComment, ReviewPlan, VetraConfig } from '../src/types';
 
 const execFileAsync = promisify(execFile);
 
@@ -12,6 +23,177 @@ async function sh(cwd: string, cmd: string, args: string[]) {
 
 async function writeJson(path: string, data: unknown) {
   await writeFile(path, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+}
+
+const SEP = '='.repeat(80);
+
+function section(title: string) {
+  process.stdout.write(`\n${SEP}\n${title}\n${SEP}\n`);
+}
+
+function json(label: string, value: unknown) {
+  process.stdout.write(`${label}:\n${JSON.stringify(value, null, 2)}\n`);
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function summarizeDiff(context: PullRequestContext) {
+  const files = context.diff.files.map((f) => {
+    const path = f.newPath ?? f.oldPath ?? '(unknown)';
+    return { file: path, additions: f.additions, deletions: f.deletions, hunks: f.hunks.length, language: f.language ?? null };
+  });
+  return {
+    filesChanged: context.diff.files.length,
+    linesAdded: context.diff.files.reduce((sum, f) => sum + f.additions, 0),
+    linesDeleted: context.diff.files.reduce((sum, f) => sum + f.deletions, 0),
+    files
+  };
+}
+
+function renderUnifiedDiff(context: PullRequestContext): string {
+  const out: string[] = [];
+  for (const file of context.diff.files) {
+    const path = file.newPath ?? file.oldPath ?? '(unknown)';
+    out.push(`File: ${path} (+${file.additions}/-${file.deletions})`);
+    for (const hunk of file.hunks) {
+      out.push(hunk.header);
+      for (const line of hunk.lines) {
+        const prefix = line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' ';
+        out.push(`${prefix}${line.content}`);
+      }
+    }
+    out.push('');
+  }
+  return out.join('\n').trimEnd();
+}
+
+function formatArtifact(a: EvidenceArtifact): string {
+  const loc = a.file ? ` (${a.file}${a.line ? `:${a.line}` : ''})` : '';
+  return `- [${a.type}] ${a.id}${loc}: ${a.title} — ${a.summary}`;
+}
+
+function formatAction(a: PlanAction): string {
+  return `- [${a.kind}] ${a.id} (cost=${a.estimatedCost}): ${a.description}`;
+}
+
+function formatComment(c: ReviewComment): string {
+  const loc =
+    c.locations.length > 0 ? ` locations=[${c.locations.map((l) => `${l.file}${l.line ? `:${l.line}` : ''}`).join(', ')}]` : '';
+  const ev = c.evidence.length > 0 ? ` evidence=[${c.evidence.map((e) => e.artifactId).join(', ')}]` : ' evidence=[]';
+  return `- [${c.id}] (${c.severity}/${c.category}/${c.confidence}) ${c.message}${loc}${ev}`;
+}
+
+function summarizeArtifacts(artifacts: EvidenceArtifact[]) {
+  const counts: Record<string, number> = {};
+  for (const a of artifacts) counts[a.type] = (counts[a.type] ?? 0) + 1;
+  return { total: artifacts.length, byType: counts };
+}
+
+async function executeWithTrace(context: PullRequestContext, plan: ReviewPlan, config: VetraConfig, label: string) {
+  section(`${label} — STEP 3: Executor (run checks + collect evidence + propose comments)`);
+
+  const model = new HeuristicVerifierModel();
+
+  const needsHead =
+    plan.actions.some((a) => a.kind === 'run_ci' || a.kind === 'mutation' || a.kind === 'metamorphic' || a.kind === 'benchmark') ||
+    Boolean(config.commands?.test) ||
+    Boolean(config.commands?.benchmark);
+  const needsBase = plan.actions.some((a) => a.kind === 'benchmark' || a.kind === 'metamorphic');
+
+  process.stdout.write(`Worktrees: needsBase=${needsBase}, needsHead=${needsHead}\n`);
+
+  const headWorktree = needsHead ? await createWorktree(context.repoRoot, context.headRef, 'demo-head') : undefined;
+  const baseWorktree = needsBase ? await createWorktree(context.repoRoot, context.baseRef, 'demo-base') : undefined;
+
+  if (baseWorktree) process.stdout.write(`Created base worktree: ${baseWorktree.path} @ ${baseWorktree.ref}\n`);
+  if (headWorktree) process.stdout.write(`Created head worktree: ${headWorktree.path} @ ${headWorktree.ref}\n`);
+
+  let candidateComments: ReviewComment[] = [];
+
+  try {
+    for (const action of plan.actions) {
+      const started = Date.now();
+      const artifactsBefore = context.artifacts.length;
+
+      section(`${label} — EXEC ACTION: ${action.kind}`);
+      process.stdout.write(`${formatAction(action)}\n`);
+
+      if (action.kind === 'gather_context') {
+        process.stdout.write('Result: already done (context is built before planning).\n');
+      } else if (action.kind === 'retrieve_knowledge') {
+        process.stdout.write('Result: already done (knowledge is loaded during context build).\n');
+      } else if (action.kind === 'run_ci') {
+        if (!config.commands?.test || !headWorktree) {
+          process.stdout.write('Result: skipped (missing config.commands.test or head worktree).\n');
+        } else {
+          const { artifact, ok } = await runCiCommand(headWorktree.path, config.commands.test, plan.budget.timeoutMs);
+          context.artifacts.push(artifact);
+          process.stdout.write(`Result: ${ok ? 'PASS' : 'FAIL'}\n`);
+          process.stdout.write(`${formatArtifact(artifact)}\n`);
+        }
+      } else if (action.kind === 'metamorphic') {
+        if (!baseWorktree || !headWorktree) {
+          process.stdout.write('Result: skipped (missing base/head worktrees).\n');
+        } else {
+          const artifacts = await runMetamorphicChecks(baseWorktree.path, headWorktree.path, context.diff, config);
+          context.artifacts.push(...artifacts);
+          const regressions = artifacts.filter((a) => a.type === 'metamorphic' && /regression/i.test(a.title));
+          process.stdout.write(`Result: produced ${artifacts.length} artifact(s), regressions=${regressions.length}\n`);
+          for (const a of artifacts) process.stdout.write(`${formatArtifact(a)}\n`);
+        }
+      } else if (action.kind === 'mutation') {
+        if (!headWorktree) {
+          process.stdout.write('Result: skipped (missing head worktree).\n');
+        } else {
+          const artifacts = await runDiffScopedMutationTesting(headWorktree.path, context.diff, config, plan.budget.timeoutMs);
+          context.artifacts.push(...artifacts);
+          const summary = artifacts.find((a) => a.type === 'mutation' && /summary/i.test(a.title));
+          const survivors = artifacts.filter((a) => a.type === 'mutation' && /Surviving mutant/i.test(a.title));
+          process.stdout.write(
+            `Result: produced ${artifacts.length} artifact(s), survivingMutants=${survivors.length}${summary?.raw ? '' : ' (no summary?)'}\n`
+          );
+          for (const a of artifacts) process.stdout.write(`${formatArtifact(a)}\n`);
+        }
+      } else if (action.kind === 'benchmark') {
+        if (!baseWorktree || !headWorktree || !config.commands?.benchmark) {
+          process.stdout.write('Result: skipped (missing base/head worktrees or config.commands.benchmark).\n');
+        } else {
+          const artifact = await runBenchmarkComparison(
+            baseWorktree.path,
+            headWorktree.path,
+            config.commands.benchmark,
+            plan.budget.timeoutMs
+          );
+          context.artifacts.push(artifact);
+          process.stdout.write('Result: benchmark comparison complete.\n');
+          process.stdout.write(`${formatArtifact(artifact)}\n`);
+        }
+      } else if (action.kind === 'llm_review') {
+        process.stdout.write(`Result: propose comments using verifier model "${model.name}".\n`);
+        candidateComments = await model.proposeComments({ context, plan });
+        process.stdout.write(`Candidate comments: ${candidateComments.length}\n`);
+        for (const c of candidateComments) process.stdout.write(`${formatComment(c)}\n`);
+      } else if (action.kind === 'llm_filter') {
+        process.stdout.write('Result: handled by harness verifier step (evidence gating + ranking).\n');
+      } else {
+        process.stdout.write('Result: skipped (not implemented in demo executor).\n');
+      }
+
+      const elapsed = Date.now() - started;
+      const added = context.artifacts.length - artifactsBefore;
+      process.stdout.write(`Action summary: artifactsAdded=${added}, elapsedMs=${elapsed}\n`);
+      process.stdout.write(`${SEP}\n`);
+    }
+
+    return { candidateComments };
+  } finally {
+    section(`${label} — Executor cleanup`);
+    await headWorktree?.cleanup();
+    await baseWorktree?.cleanup();
+    process.stdout.write('Cleaned up demo worktrees.\n');
+  }
 }
 
 async function main() {
@@ -63,7 +245,7 @@ async function main() {
     );
 
     // Vetra config lives in-repo for the demo.
-    await writeJson(join(root, 'vetra.config.json'), {
+    const demoConfig: VetraConfig = {
       commands: { test: 'node --test', benchmark: 'node bench.js' },
       checks: {
         metamorphic: {
@@ -81,7 +263,8 @@ async function main() {
         northStarMarkdownPath: 'knowledge/north-star.md',
         architectureMarkdownPath: 'knowledge/architecture.md'
       }
-    });
+    };
+    await writeJson(join(root, 'vetra.config.json'), demoConfig);
 
     await writeJson(join(root, 'package.json'), {
       name: 'vetra-demo-repo',
@@ -207,40 +390,66 @@ async function main() {
     await sh(root, 'git', ['commit', '-m', 'auth changes (demo)']);
     const head = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim();
 
-    const vetraCli = join(process.cwd(), 'dist/src/cli.js');
-    const commonArgs = [
-      vetraCli,
-      'review',
-      '--no-log',
-      '--repo',
-      root,
-      '--base',
-      base,
-      '--head',
-      head,
-      '--title',
-      'DEMO-123: Harden auth normalization',
-      '--desc',
-      'Implements DEMO-123; tests still pass, but deeper checks should catch regressions.'
-    ];
+    section('DEMO: Repository + PR metadata');
+    process.stdout.write(`repoRoot: ${root}\nbaseRef: ${base}\nheadRef: ${head}\n`);
 
-    process.stdout.write('=== QUICK REVIEW (override budget) ===\n\n');
-    const quick = await execFileAsync('node', [...commonArgs, '--budget', 'quick'], {
-      cwd: process.cwd(),
-      maxBuffer: 10 * 1024 * 1024
-    });
-    process.stdout.write(quick.stdout);
-    process.stderr.write(quick.stderr);
+    const meta = {
+      id: 'demo',
+      title: 'DEMO-123: Harden auth normalization',
+      description: 'Implements DEMO-123; tests still pass, but deeper checks should catch regressions.',
+      source: 'local' as const
+    };
 
-    process.stdout.write('\n\n=== AUTO REVIEW (risk-budgeted) ===\n\n');
-    const auto = await execFileAsync('node', commonArgs, {
-      cwd: process.cwd(),
-      maxBuffer: 10 * 1024 * 1024
-    });
-    process.stdout.write(auto.stdout);
-    process.stderr.write(auto.stderr);
+    section('DEMO: PR object (PullRequestContext)');
+    const baseContext = await buildPullRequestContext({ repoRoot: root, baseRef: base, headRef: head, meta, config: demoConfig });
+    json('meta', baseContext.meta);
+    json('riskFeatures', baseContext.riskFeatures);
+    json('knowledge', baseContext.knowledge);
+    json('diffSummary', summarizeDiff(baseContext));
+    process.stdout.write(`\nUnified diff:\n${renderUnifiedDiff(baseContext)}\n`);
+    process.stdout.write(`\nInitial artifacts (knowledge):\n${baseContext.artifacts.map(formatArtifact).join('\n')}\n`);
+    json('pullRequestContext', baseContext);
+
+    const runOne = async (label: string, overrideBudget?: BudgetMode) => {
+      section(`${label} — STEP 1: Clone PR object`);
+      const context = cloneJson(baseContext);
+      process.stdout.write(`Starting artifacts: ${JSON.stringify(summarizeArtifacts(context.artifacts))}\n`);
+
+      section(`${label} — STEP 2: Planner (risk -> budget -> actions)`);
+      const plan = planReview(context, demoConfig, overrideBudget);
+      json('riskScore', plan.risk);
+      json('budget', plan.budget);
+      process.stdout.write(`Planned actions (${plan.actions.length}):\n${plan.actions.map(formatAction).join('\n')}\n`);
+      json('plan', plan);
+
+      const execRes = await executeWithTrace(context, plan, demoConfig, label);
+
+      section(`${label} — STEP 4: Harness verifier (evidence gating + ranking)`);
+      const finalComments = verifyAndRankComments(context, plan, execRes.candidateComments, demoConfig);
+      process.stdout.write(`Candidate comments: ${execRes.candidateComments.length}\n`);
+      process.stdout.write(`Final comments: ${finalComments.length}\n`);
+      if (execRes.candidateComments.length > 0) {
+        process.stdout.write(`\nCandidates:\n${execRes.candidateComments.map(formatComment).join('\n')}\n`);
+      }
+      if (finalComments.length > 0) {
+        process.stdout.write(`\nFinal:\n${finalComments.map(formatComment).join('\n')}\n`);
+      }
+
+      section(`${label} — STEP 5: Rendered review (Markdown)`);
+      const markdown = formatReviewMarkdown(plan, context.knowledge, context.artifacts, finalComments);
+      process.stdout.write(`${markdown}\n`);
+    };
+
+    await runOne('QUICK REVIEW (budget override = quick)', 'quick');
+    await runOne('AUTO REVIEW (risk-budgeted)', undefined);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    const keep = process.env.VETRA_DEMO_KEEP === '1';
+    if (keep) {
+      section('DEMO: Keeping temp repo');
+      process.stdout.write(`VETRA_DEMO_KEEP=1; keeping demo repo at: ${root}\n`);
+    } else {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 }
 

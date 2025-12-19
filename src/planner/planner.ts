@@ -44,7 +44,8 @@ export function planReview(context: PullRequestContext, config: VetraConfig, ove
     });
   }
 
-  if (budget.mode !== 'quick') {
+  const mutationEnabled = config.checks?.mutation?.enabled ?? true;
+  if (mutationEnabled && budget.mode !== 'quick' && config.commands?.test) {
     actions.push({
       id: newId('action'),
       kind: 'mutation',

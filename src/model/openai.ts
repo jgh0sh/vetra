@@ -5,9 +5,10 @@ import type { CheckCommentsInput, CommentChecker } from './checker';
 import type { ProposeCommentsInput, VerifierModel } from './model';
 
 export interface OpenAIModelOptions {
-  apiKey: string;
+  apiKey: string | string[];
   model: string;
-  baseUrl?: string; // default: https://api.openai.com
+  baseUrl?: string | string[]; // default: https://api.openai.com
+  headers?: Record<string, string>;
 }
 
 const REVIEW_SYSTEM_PROMPT = [
@@ -42,6 +43,20 @@ const CHECKER_SYSTEM_PROMPT = [
   '',
   'Output ONLY valid JSON.'
 ].join('\n');
+
+function pickOne(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return undefined;
+    return value[Math.floor(Math.random() * value.length)];
+  }
+  if (typeof value === 'string') return value;
+  return undefined;
+}
+
+function normalizeBaseUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  return trimmed.endsWith('/v1') ? trimmed.slice(0, -3) : trimmed;
+}
 
 function renderKnowledgeForPrompt(knowledge: KnowledgeContext): string {
   const out: string[] = [];
@@ -236,7 +251,9 @@ export class OpenAIChatVerifierModel implements VerifierModel {
   constructor(private options: OpenAIModelOptions) {}
 
   async proposeComments(input: ProposeCommentsInput): Promise<ReviewComment[]> {
-    const baseUrl = (this.options.baseUrl ?? 'https://api.openai.com').replace(/\/+$/, '');
+    const baseUrl = normalizeBaseUrl(pickOne(this.options.baseUrl) ?? 'https://api.openai.com');
+    const apiKey = pickOne(this.options.apiKey);
+    if (!apiKey) throw new Error('Missing OpenAI apiKey.');
 
     const userPrompt = [
       `PR Title: ${input.context.meta.title}`,
@@ -266,7 +283,8 @@ export class OpenAIChatVerifierModel implements VerifierModel {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.options.apiKey}`,
+        ...(this.options.headers ?? {}),
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -325,7 +343,9 @@ export class OpenAIChatCommentChecker implements CommentChecker {
   constructor(private options: OpenAIModelOptions) {}
 
   async checkComments(input: CheckCommentsInput): Promise<CommentCheckDecision[]> {
-    const baseUrl = (this.options.baseUrl ?? 'https://api.openai.com').replace(/\/+$/, '');
+    const baseUrl = normalizeBaseUrl(pickOne(this.options.baseUrl) ?? 'https://api.openai.com');
+    const apiKey = pickOne(this.options.apiKey);
+    if (!apiKey) throw new Error('Missing OpenAI apiKey.');
 
     const userPrompt = [
       `PR Title: ${input.context.meta.title}`,
@@ -360,7 +380,8 @@ export class OpenAIChatCommentChecker implements CommentChecker {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.options.apiKey}`,
+        ...(this.options.headers ?? {}),
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({

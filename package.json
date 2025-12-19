@@ -11,7 +11,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "demo": "npm run build && node dist/scripts/demo.js",
+    "demo": "node scripts/run_demo_with_log.js",
+    "bench:swr": "bash scripts/run_swrbench_benchmark.sh",
     "dev": "tsc -w -p tsconfig.json"
   },
   "devDependencies": {
